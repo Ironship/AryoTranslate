@@ -73,9 +73,9 @@ def error_handling_in_tts(error, segment, TRANSLATE_AUDIO_TO, filename):
         logger.critical(f"Error: {str(error)}")
         sample_rate_aux = 22050
         duration = float(segment["end"]) - float(segment["start"])
-        data = np.zeros(int(sample_rate_aux * duration)).astype(np.float32)
+        silence_buffer = np.zeros(int(sample_rate_aux * duration)).astype(np.float32)
         write_chunked(
-            filename, data, sample_rate_aux, format="ogg", subtype="vorbis"
+            filename, silence_buffer, sample_rate_aux, format="ogg", subtype="vorbis"
         )
         logger.error("Audio will be replaced -> [silent audio].")
         verify_saved_file_and_size(filename)
@@ -152,7 +152,7 @@ def edge_tts_voices_list():
     return formatted_voices
 
 
-def segments_egde_tts(filtered_edge_segments, TRANSLATE_AUDIO_TO, is_gui):
+def segments_edge_tts(filtered_edge_segments, TRANSLATE_AUDIO_TO, is_gui):
     for segment in tqdm(filtered_edge_segments["segments"]):
         speaker = segment["speaker"] # noqa
         text = segment["text"]
@@ -177,15 +177,15 @@ def segments_egde_tts(filtered_edge_segments, TRANSLATE_AUDIO_TO, is_gui):
                 run_command(command)
             verify_saved_file_and_size(temp_file)
 
-            data, sample_rate = sf.read(temp_file)
-            data = pad_array(data, sample_rate)
+            audio_data, sample_rate = sf.read(temp_file)
+            audio_data = pad_array(audio_data, sample_rate)
             # os.remove(temp_file)
 
             # Save file
             write_chunked(
                 file=filename,
                 samplerate=sample_rate,
-                data=data,
+                data=audio_data,
                 format="ogg",
                 subtype="vorbis",
             )
@@ -1047,7 +1047,7 @@ def audio_segmentation_to_voice(
     # Infer
     if filtered_edge["segments"]:
         logger.info(f"EDGE TTS: {speakers_edge}")
-        segments_egde_tts(filtered_edge, TRANSLATE_AUDIO_TO, is_gui)  # mp3
+        segments_edge_tts(filtered_edge, TRANSLATE_AUDIO_TO, is_gui)  # mp3
     if filtered_bark["segments"]:
         logger.info(f"BARK TTS: {speakers_bark}")
         segments_bark_tts(

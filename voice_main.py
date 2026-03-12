@@ -25,7 +25,7 @@ from soni_translate.utils import (
 from scipy import signal
 from time import time as ttime
 import faiss
-from vci_pipeline import VC, change_rms, bh, ah
+from vci_pipeline import VC, change_rms, highpass_filter_b, highpass_filter_a
 import librosa
 
 warnings.filterwarnings("ignore")
@@ -47,8 +47,8 @@ class Config:
 
     def device_config(self, only_cpu) -> tuple:
         if torch.cuda.is_available() and not only_cpu:
-            i_device = int(self.device.split(":")[-1])
-            self.gpu_name = torch.cuda.get_device_name(i_device)
+            device_index = int(self.device.split(":")[-1])
+            self.gpu_name = torch.cuda.get_device_name(device_index)
             if (
                 ("16" in self.gpu_name and "V100" not in self.gpu_name.upper())
                 or "P40" in self.gpu_name.upper()
@@ -64,7 +64,7 @@ class Config:
             else:
                 self.gpu_name = None
             self.gpu_mem = int(
-                torch.cuda.get_device_properties(i_device).total_memory
+                torch.cuda.get_device_properties(device_index).total_memory
                 / 1024
                 / 1024
                 / 1024
@@ -146,43 +146,43 @@ def load_trained_model(model_path, config):
         raise ValueError("No model found")
 
     logger.info("Loading %s" % model_path)
-    cpt = torch.load(model_path, map_location="cpu")
-    tgt_sr = cpt["config"][-1]
-    cpt["config"][-3] = cpt["weight"]["emb_g.weight"].shape[0]  # n_spk
-    if_f0 = cpt.get("f0", 1)
-    if if_f0 == 0:
+    model_checkpoint = torch.load(model_path, map_location="cpu")
+    target_sample_rate = model_checkpoint["config"][-1]
+    model_checkpoint["config"][-3] = model_checkpoint["weight"]["emb_g.weight"].shape[0]  # n_spk
+    has_pitch_features = model_checkpoint.get("f0", 1)
+    if has_pitch_features == 0:
         # protect to 0.5 need?
         pass
 
-    version = cpt.get("version", "v1")
+    version = model_checkpoint.get("version", "v1")
     if version == "v1":
-        if if_f0 == 1:
-            net_g = SynthesizerTrnMs256NSFsid(
-                *cpt["config"], is_half=config.is_half
+        if has_pitch_features == 1:
+            generator_network = SynthesizerTrnMs256NSFsid(
+                *model_checkpoint["config"], is_half=config.is_half
             )
         else:
-            net_g = SynthesizerTrnMs256NSFsid_nono(*cpt["config"])
+            generator_network = SynthesizerTrnMs256NSFsid_nono(*model_checkpoint["config"])
     elif version == "v2":
-        if if_f0 == 1:
-            net_g = SynthesizerTrnMs768NSFsid(
-                *cpt["config"], is_half=config.is_half
+        if has_pitch_features == 1:
+            generator_network = SynthesizerTrnMs768NSFsid(
+                *model_checkpoint["config"], is_half=config.is_half
             )
         else:
-            net_g = SynthesizerTrnMs768NSFsid_nono(*cpt["config"])
-    del net_g.enc_q
+            generator_network = SynthesizerTrnMs768NSFsid_nono(*model_checkpoint["config"])
+    del generator_network.enc_q
 
-    net_g.load_state_dict(cpt["weight"], strict=False)
-    net_g.eval().to(config.device)
+    generator_network.load_state_dict(model_checkpoint["weight"], strict=False)
+    generator_network.eval().to(config.device)
 
     if config.is_half:
-        net_g = net_g.half()
+        generator_network = generator_network.half()
     else:
-        net_g = net_g.float()
+        generator_network = generator_network.float()
 
-    vc = VC(tgt_sr, config)
-    n_spk = cpt["config"][-3]
+    vc = VC(target_sample_rate, config)
+    num_speakers = model_checkpoint["config"][-3]
 
-    return n_spk, tgt_sr, net_g, vc, cpt, version
+    return num_speakers, target_sample_rate, generator_network, vc, model_checkpoint, version
 
 
 class ClassVoices:
@@ -239,19 +239,19 @@ class ClassVoices:
         task_id,
         params,
         # load model
-        n_spk,
-        tgt_sr,
-        net_g,
+        num_speakers,
+        target_sample_rate,
+        generator_network,
         pipe,
-        cpt,
+        model_checkpoint,
         version,
-        if_f0,
+        has_pitch_features,
         # load index
         index_rate,
         index,
         big_npy,
         # load f0 file
-        inp_f0,
+        input_pitch_override,
         # audio file
         input_audio_path,
         overwrite,
@@ -283,7 +283,7 @@ class ClassVoices:
 
         # filters audio signal, pads it, computes sliding window sums,
         # and extracts optimized time indices
-        audio = signal.filtfilt(bh, ah, audio)
+        audio = signal.filtfilt(highpass_filter_b, highpass_filter_a, audio)
         audio_pad = np.pad(
             audio, (pipe.window // 2, pipe.window // 2), mode="reflect"
         )
@@ -292,72 +292,72 @@ class ClassVoices:
             audio_sum = np.zeros_like(audio)
             for i in range(pipe.window):
                 audio_sum += audio_pad[i:i - pipe.window]
-            for t in range(pipe.t_center, audio.shape[0], pipe.t_center):
+            for interval_point in range(pipe.t_center, audio.shape[0], pipe.t_center):
                 opt_ts.append(
-                    t
+                    interval_point
                     - pipe.t_query
                     + np.where(
-                        np.abs(audio_sum[t - pipe.t_query: t + pipe.t_query])
-                        == np.abs(audio_sum[t - pipe.t_query: t + pipe.t_query]).min()
+                        np.abs(audio_sum[interval_point - pipe.t_query: interval_point + pipe.t_query])
+                        == np.abs(audio_sum[interval_point - pipe.t_query: interval_point + pipe.t_query]).min()
                     )[0][0]
                 )
 
-        s = 0
+        audio_segment_start = 0
         audio_opt = []
-        t = None
-        t1 = ttime()
+        segment_split_point = None
+        time_pitch_start = ttime()
 
         sid_value = 0
-        sid = torch.tensor(sid_value, device=pipe.device).unsqueeze(0).long()
+        speaker_id_tensor = torch.tensor(sid_value, device=pipe.device).unsqueeze(0).long()
 
         # Pads audio symmetrically, calculates length divided by window size.
         audio_pad = np.pad(audio, (pipe.t_pad, pipe.t_pad), mode="reflect")
-        p_len = audio_pad.shape[0] // pipe.window
+        pitch_frame_length = audio_pad.shape[0] // pipe.window
 
         # Estimates pitch from audio signal
-        pitch, pitchf = None, None
-        if if_f0 == 1:
-            pitch, pitchf = pipe.get_f0(
+        pitch, pitch_float_values = None, None
+        if has_pitch_features == 1:
+            pitch, pitch_float_values = pipe.get_f0(
                 input_audio_path,
                 audio_pad,
-                p_len,
+                pitch_frame_length,
                 f0_up_key,
                 f0_method,
                 filter_radius,
-                inp_f0,
+                input_pitch_override,
             )
-            pitch = pitch[:p_len]
-            pitchf = pitchf[:p_len]
+            pitch = pitch[:pitch_frame_length]
+            pitch_float_values = pitch_float_values[:pitch_frame_length]
             if pipe.device == "mps":
-                pitchf = pitchf.astype(np.float32)
+                pitch_float_values = pitch_float_values.astype(np.float32)
             pitch = torch.tensor(
                 pitch, device=pipe.device
             ).unsqueeze(0).long()
-            pitchf = torch.tensor(
-                pitchf, device=pipe.device
+            pitch_float_values = torch.tensor(
+                pitch_float_values, device=pipe.device
             ).unsqueeze(0).float()
 
-        t2 = ttime()
-        times[1] += t2 - t1
-        for t in opt_ts:
-            t = t // pipe.window * pipe.window
-            if if_f0 == 1:
+        time_pitch_end = ttime()
+        times[1] += time_pitch_end - time_pitch_start
+        for segment_split_point in opt_ts:
+            segment_split_point = segment_split_point // pipe.window * pipe.window
+            if has_pitch_features == 1:
                 pitch_slice = pitch[
-                    :, s // pipe.window: (t + pipe.t_pad2) // pipe.window
+                    :, audio_segment_start // pipe.window: (segment_split_point + pipe.t_pad2) // pipe.window
                 ]
-                pitchf_slice = pitchf[
-                    :, s // pipe.window: (t + pipe.t_pad2) // pipe.window
+                pitchf_slice = pitch_float_values[
+                    :, audio_segment_start // pipe.window: (segment_split_point + pipe.t_pad2) // pipe.window
                 ]
             else:
                 pitch_slice = None
                 pitchf_slice = None
 
-            audio_slice = audio_pad[s:t + pipe.t_pad2 + pipe.window]
+            audio_slice = audio_pad[audio_segment_start:segment_split_point + pipe.t_pad2 + pipe.window]
             audio_opt.append(
                 pipe.vc(
                     self.hu_bert_model,
-                    net_g,
-                    sid,
+                    generator_network,
+                    speaker_id_tensor,
                     audio_slice,
                     pitch_slice,
                     pitchf_slice,
@@ -369,21 +369,21 @@ class ClassVoices:
                     protect,
                 )[pipe.t_pad_tgt:-pipe.t_pad_tgt]
             )
-            s = t
+            audio_segment_start = segment_split_point
 
         pitch_end_slice = pitch[
-            :, t // pipe.window:
-        ] if t is not None else pitch
-        pitchf_end_slice = pitchf[
-            :, t // pipe.window:
-        ] if t is not None else pitchf
+            :, segment_split_point // pipe.window:
+        ] if segment_split_point is not None else pitch
+        pitchf_end_slice = pitch_float_values[
+            :, segment_split_point // pipe.window:
+        ] if segment_split_point is not None else pitch_float_values
 
         audio_opt.append(
             pipe.vc(
                 self.hu_bert_model,
-                net_g,
-                sid,
-                audio_pad[t:],
+                generator_network,
+                speaker_id_tensor,
+                audio_pad[segment_split_point:],
                 pitch_end_slice,
                 pitchf_end_slice,
                 times,
@@ -398,25 +398,25 @@ class ClassVoices:
         audio_opt = np.concatenate(audio_opt)
         if rms_mix_rate != 1:
             audio_opt = change_rms(
-                audio, 16000, audio_opt, tgt_sr, rms_mix_rate
+                audio, 16000, audio_opt, target_sample_rate, rms_mix_rate
             )
-        if resample_sr >= 16000 and tgt_sr != resample_sr:
+        if resample_sr >= 16000 and target_sample_rate != resample_sr:
             audio_opt = librosa.resample(
-                audio_opt, orig_sr=tgt_sr, target_sr=resample_sr
+                audio_opt, orig_sr=target_sample_rate, target_sr=resample_sr
             )
         audio_max = np.abs(audio_opt).max() / 0.99
         max_int16 = 32768
         if audio_max > 1:
             max_int16 /= audio_max
         audio_opt = (audio_opt * max_int16).astype(np.int16)
-        del pitch, pitchf, sid
+        del pitch, pitch_float_values, speaker_id_tensor
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        if tgt_sr != resample_sr >= 16000:
+        if target_sample_rate != resample_sr >= 16000:
             final_sr = resample_sr
         else:
-            final_sr = tgt_sr
+            final_sr = target_sample_rate
 
         """
         "Success.\n %s\nTime:\n npy:%ss, f0:%ss, infer:%ss" % (
@@ -593,17 +593,17 @@ class ClassVoices:
 
                 # Unload previous
                 (
-                    n_spk,
-                    tgt_sr,
-                    net_g,
+                    num_speakers,
+                    target_sample_rate,
+                    generator_network,
                     pipe,
-                    cpt,
+                    model_checkpoint,
                     version,
-                    if_f0,
+                    has_pitch_features,
                     index_rate,
                     index,
                     big_npy,
-                    inp_f0,
+                    input_pitch_override,
                 ) = [None] * 11
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -619,14 +619,14 @@ class ClassVoices:
 
                 # Load model
                 (
-                    n_spk,
-                    tgt_sr,
-                    net_g,
+                    num_speakers,
+                    target_sample_rate,
+                    generator_network,
                     pipe,
-                    cpt,
+                    model_checkpoint,
                     version
                 ) = load_trained_model(model_path, self.config)
-                if_f0 = cpt.get("f0", 1)  # pitch data
+                has_pitch_features = model_checkpoint.get("f0", 1)  # pitch data
 
                 # Load index
                 if os.path.exists(file_index) and index_rate != 0:
@@ -643,15 +643,15 @@ class ClassVoices:
                     index = big_npy = None
 
                 # Load f0 file
-                inp_f0 = None
+                input_pitch_override = None
                 if os.path.exists(f0_file):
                     try:
                         with open(f0_file, "r") as f:
                             lines = f.read().strip("\n").split("\n")
-                        inp_f0 = []
+                        input_pitch_override = []
                         for line in lines:
-                            inp_f0.append([float(i) for i in line.split(",")])
-                        inp_f0 = np.array(inp_f0, dtype="float32")
+                            input_pitch_override.append([float(i) for i in line.split(",")])
+                        input_pitch_override = np.array(input_pitch_override, dtype="float32")
                     except Exception as error:
                         logger.error(f"f0 file: {str(error)}")
 
@@ -674,19 +674,19 @@ class ClassVoices:
             #     id_tag,
             #     params,
             #     # load model
-            #     n_spk,
-            #     tgt_sr,
-            #     net_g,
+            #     num_speakers,
+            #     target_sample_rate,
+            #     generator_network,
             #     pipe,
-            #     cpt,
+            #     model_checkpoint,
             #     version,
-            #     if_f0,
+            #     has_pitch_features,
             #     # load index
             #     index_rate,
             #     index,
             #     big_npy,
             #     # load f0 file
-            #     inp_f0,
+            #     input_pitch_override,
             #     # output file
             #     input_audio_path,
             #     overwrite,
@@ -698,19 +698,19 @@ class ClassVoices:
                     id_tag,
                     params,
                     # loaded model
-                    n_spk,
-                    tgt_sr,
-                    net_g,
+                    num_speakers,
+                    target_sample_rate,
+                    generator_network,
                     pipe,
-                    cpt,
+                    model_checkpoint,
                     version,
-                    if_f0,
+                    has_pitch_features,
                     # loaded index
                     index_rate,
                     index,
                     big_npy,
                     # loaded f0 file
-                    inp_f0,
+                    input_pitch_override,
                     # audio file
                     input_audio_path,
                     overwrite,
